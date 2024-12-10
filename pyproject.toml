@@ -14,10 +14,10 @@ celery = ">5.3"
 redis = "*"
 
 [tool.poetry.dev-dependencies]
-pytest = "^7.1.2"
+pytest = "^8.3.4"
 bumpversion = "^0.6.0"
-coverage = "^6.4.4"
-pytest-cov = "^3.0.0"
+coverage = "^7.6.9"
+pytest-cov = "^6.0.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
