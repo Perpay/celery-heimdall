@@ -2,7 +2,7 @@ import hashlib
 from abc import ABC
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache
+from functools import cache, cached_property
 from typing import Callable
 
 import celery
@@ -13,6 +13,7 @@ from kombu.utils import uuid
 
 from . import lock
 from .errors import AlreadyQueuedError
+from .rate import get_rate_limits, check_rate_limits
 
 
 class RateLimitStrategy(Enum):
@@ -29,10 +30,13 @@ class RateLimit:
     A rate limit configuration for a HeimdallTask.
     """
 
-    # The rate limit to apply to the task. Can be a tuple in the form of
-    # (times, per) or a callable that returns a tuple.
-    rate_limit: tuple | Callable
-    # The strategy to use for rate limiting.
+    #: The rate limit to apply to the task. Can be a tuple in the form of
+    #: (times, per) or a callable that returns the tuple.
+    rate_limit: tuple[int, int] | Callable[..., tuple[int, int]]
+    #: The key to use for rate limiting. If not provided, the key will be
+    #: taken from the unique key of the task.
+    key: str | None = None
+    #: The strategy to use for rate limiting.
     strategy: RateLimitStrategy = RateLimitStrategy.DEFAULT
 
 
@@ -53,29 +57,32 @@ class HeimdallConfig:
     Configuration options for a HeimdallTask.
     """
 
-    # If True, the task will be globally unique, allowing only one instance
-    # to run or be queued at a time.
+    #: If True, the task will be globally unique, allowing only one instance
+    #: to run or be queued at a time.
     unique: bool = False
-    # If True, the lock will be acquired before the task is queued.
+    #: If True, the lock will be acquired before the task is queued.
     unique_early: bool = True
-    # If True, the lock will be acquired when the task is started.
+    #: If True, the lock will be acquired when the task is started.
     unique_late: bool = True
-    # If True, the task will raise an exception if it's already queued.
+    #: If True, the task will raise an exception if it's already queued.
     unique_raises: bool = False
-    # The amount of time to wait before allowing the task lock to expire,
-    # even if the task has not yet completed.
+    #: The amount of time to wait before allowing the task lock to expire,
+    #: even if the task has not yet completed.
     unique_expiry: int = 60 * 100
-    # If True, the task will wait for the lock to expire instead of releasing
-    # it, even if the task has already completed. This can be used to easily
-    # implement tasks that should only run once per interval.
+    #: If True, the task will wait for the lock to expire instead of releasing
+    #: it, even if the task has already completed. This can be used to easily
+    #: implement tasks that should only run once per interval.
     unique_wait_for_expiry: bool = False
-    # A user-provided unique key for the task. If not specified, a unique
-    # key will be generated from the task's arguments.
-    key: str | Callable = None
+    #: A user-provided unique key for the task. If not specified, a unique
+    #: key will be generated from the task's arguments.
+    key: str | Callable[..., str] = None
+    #: The rate limit to apply to the task. Can optionally be a list of
+    #: rate limits which will be applied in order.
+    rate_limit: RateLimit | list[RateLimit] | None = None
 
-    # The default prefix to use for the task lock key.
+    #: The default prefix to use for the task lock key.
     lock_prefix: str = "h-lock"
-    # The default prefix to use for the rate limit key.
+    #: The default prefix to use for the rate limit key.
     rate_limit_prefix: str = "h-rate"
 
     def get_redis(self, app: Celery) -> redis.Redis:
@@ -151,53 +158,6 @@ class HeimdallConfig:
         return f"{self.get_lock_prefix()}:{k}".encode("utf-8")
 
 
-class HeimdallNamespace:
-    """
-    A namespace for Heimdall configuration and utilities for a task, to keep
-    them from conflicting with other task mixins.
-    """
-
-    def __init__(self, task: "HeimdallTask"):
-        self.task = task
-        self.config = getattr(task, "heimdall", HeimdallConfig())
-        self.redis = self.config.get_redis(task.app)
-
-    def extend_lock(self, milliseconds: int):
-        """
-        Extends the expiry on the lock for the current task by the given number
-        of milliseconds.
-        """
-        if not self.config.unique:
-            raise ValueError("Task is not configured to have a unique lock")
-
-        key = self.config.get_key(
-            self.task, self.task.request.args, self.task.request.kwargs
-        )
-
-        return lock.extend(
-            self.redis,
-            key,
-            self.task.request.id.encode("utf-8"),
-            milliseconds,
-            replace=False,
-        )
-
-    def clear_lock(self) -> bool:
-        """
-        Clears the lock for the current task.
-        """
-        if not self.config.unique:
-            raise ValueError("Task is not configured to have a unique lock")
-
-        key = self.config.get_key(
-            self.task, self.task.request.args, self.task.request.kwargs
-        )
-
-        return lock.release(
-            self.redis, key, token=self.task.request.id.encode("utf-8")
-        )
-
-
 class HeimdallTask(celery.Task, ABC):
     """
     A base task for Celery that adds helpful features such as global rate
@@ -209,23 +169,35 @@ class HeimdallTask(celery.Task, ABC):
 
     abstract = True
 
-    def __init__(self, *args, **kwargs):
-        self._bifrost = None
-        super().__init__(*args, **kwargs)
-
     def __call__(self, *args, **kwargs):
-        bifrost = self.bifrost()
+        if self.h_config.rate_limit is not None:
+            rate_limits = get_rate_limits(self, self.h_config, args, kwargs)
+            if rate_limits:
+                delay = check_rate_limits(self.h_redis, rate_limits)
+                if delay > 0:
+                    # We don't want our rescheduling retry to count against
+                    # any normal retry limits the user might have set on the
+                    # task or globally.
+                    self.request.retries -= 1
+                    # Max retries needs to be set to None _before_ calling
+                    # retry(). This value will not propagate, allowing the user's
+                    # normal retry behaviour to apply on the next call.
+                    self.max_retries = None
+                    # Retrying with a future ETA is flawed in Celery. Celery
+                    # will schedule these by pulling them into worker memory
+                    # which can cause massive problems on busy queues.
+                    raise self.retry(countdown=delay)
 
         # Acquire a globally unique lock for this task at the time it's
         # executed.
-        if bifrost.config.unique and bifrost.config.unique_late:
-            key = bifrost.config.get_key(self, args, kwargs)
+        if self.h_config.unique and self.h_config.unique_late:
+            key = self.h_config.get_key(self, args, kwargs)
 
             token = lock.lock(
-                bifrost.redis,
+                self.h_redis,
                 key,
                 token=self.request.id.encode("utf-8"),
-                expiry=bifrost.config.unique_expiry,
+                expiry=self.h_config.unique_expiry,
             ).decode("utf-8")
 
             if not token == self.request.id:
@@ -234,24 +206,22 @@ class HeimdallTask(celery.Task, ABC):
         return self.run(*args, **kwargs)
 
     def apply_async(self, args=None, kwargs=None, task_id=None, **options):
-        bifrost = self.bifrost()
-
-        if bifrost.config.unique and bifrost.config.unique_early:
+        if self.h_config.unique and self.h_config.unique_early:
             # Acquire a globally unique lock for this task before it's queued.
             # In some cases, this function may not be called, such as by
             # send_task() or non-standard task execution.
             task_id: str = task_id or uuid()
-            key = bifrost.config.get_key(self, args, kwargs)
+            key = self.h_config.get_key(self, args, kwargs)
 
             token = lock.lock(
-                bifrost.redis,
+                self.h_redis,
                 key,
                 token=task_id.encode("utf-8"),
-                expiry=bifrost.config.unique_expiry,
+                expiry=self.h_config.unique_expiry,
             ).decode("utf-8")
 
             if not token == task_id:
-                if not bifrost.config.unique_raises:
+                if not self.h_config.unique_raises:
                     # If the task is not configured to raise an exception when
                     # it's already queued, we'll just return the task ID of the
                     # task that already holds the lock.
@@ -268,29 +238,72 @@ class HeimdallTask(celery.Task, ABC):
         # Handles post-task cleanup, when a task exits cleanly. This will be
         # called if a task raises an exception (stored in `einfo`), but not
         # if a worker straight up dies (say, because of running out of memory)
-        bifrost = self.bifrost()
 
-        # Cleanup the unique task lock when the task finishes, unless the user
-        # told us to wait for the remaining interval.
-        if bifrost.config.unique and not bifrost.config.unique_wait_for_expiry:
-            key = bifrost.config.get_key(self, args, kwargs)
+        if self.h_config.unique and not self.h_config.unique_wait_for_expiry:
+            key = self.h_config.get_key(self, args, kwargs)
             # It's not an error for our lock to have already been cleared by
             # another token, because our token may have expired.
-            lock.release(bifrost.redis, key, token=task_id.encode("utf-8"))
+            lock.release(self.h_redis, key, token=task_id.encode("utf-8"))
 
         super().after_return(status, retval, task_id, args, kwargs, einfo)
 
-    def bifrost(self) -> HeimdallNamespace:
+    @cached_property
+    def h_config(self) -> HeimdallConfig:
         """
-        Get the Heimdall namespace for the task.
-
-        This object contains the Heimdall configuration for this task, redis
-        caches, and other helpful utilities. It's designed to be used by the
-        task to interact with Heimdall features while minimizing conflicts
-        with other Task implementations.
+        Heimdall's configuration for the current task.
         """
-        if self._bifrost is not None:
-            return self._bifrost
+        return getattr(self, "heimdall", HeimdallConfig())
 
-        self._bifrost = HeimdallNamespace(self)
-        return self._bifrost
+    @cached_property
+    def h_redis(self) -> redis.Redis:
+        """
+        Heimdall's cached redis connection.
+        """
+        return self.h_config.get_redis(self.app)
+
+    def h_only_after(self, key: str, seconds: int) -> bool:
+        """
+        Only returns true if either the key has expired in the cache or if
+        the current task already holds the key.
+
+        This can be used to gate parts of a task that should only be run
+        once per time period.
+
+        .. code-block:: python
+
+        @shared_task(bind=True, task=HeimdallTask)
+        def my_task(self, *args, **kwargs):
+            if self.only_after("my_task", 60 * 60):
+                print(
+                    "It's been at least an hour since this task was"
+                    " last run."
+                )
+        """
+
+        token = self.request.id.encode("utf-8")
+        return lock.lock(
+            self.h_redis,
+            key.encode("utf-8"),
+            token=token,
+            expiry=seconds,
+        ) == token
+
+    def h_extend_lock(self, milliseconds: int):
+        """
+        Extends the expiry on the lock for the current task by the given number
+        of milliseconds.
+        """
+        if not self.h_config.unique:
+            raise ValueError("Task is not configured to have a unique lock")
+
+        key = self.h_config.get_key(
+            self, self.request.args, self.request.kwargs
+        )
+
+        return lock.extend(
+            self.h_redis,
+            key,
+            self.request.id.encode("utf-8"),
+            milliseconds,
+            replace=False,
+        )

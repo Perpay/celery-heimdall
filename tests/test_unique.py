@@ -8,8 +8,7 @@ import celery
 import pytest
 from celery.result import AsyncResult
 
-from celery_heimdall import HeimdallTask, AlreadyQueuedError
-from celery_heimdall.task import HeimdallConfig
+from celery_heimdall import HeimdallTask, AlreadyQueuedError, HeimdallConfig
 
 
 @celery.shared_task(base=HeimdallTask, heimdall=HeimdallConfig(unique=True))
@@ -46,7 +45,7 @@ def explicit_key_callable_task():
 )
 def task_with_override_config(task: HeimdallTask):
     time.sleep(2)
-    return task.bifrost().config.get_lock_prefix()
+    return task.h_config.get_lock_prefix()
 
 
 @celery.shared_task(
