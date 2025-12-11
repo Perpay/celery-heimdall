@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "celery-heimdall"
-version = "1.0.1"
+version = "1.0.2"
 description = "Helpful celery extensions."
 authors = ["Tyler Kennedy <tk@tkte.ch>"]
 license = "MIT"
