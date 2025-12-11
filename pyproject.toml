@@ -9,7 +9,7 @@ homepage = "https://github.com/tktech/celery-heimdall"
 repository = "https://github.com/tktech/celery-heimdall"
 
 [tool.poetry.dependencies]
-python = "^3.8"
+python = "^3.9"
 celery = "*"
 redis = "*"
 click = {version = "*", optional = true}
