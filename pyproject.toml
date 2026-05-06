@@ -11,6 +11,7 @@ repository = "https://github.com/tktech/celery-heimdall"
 [tool.poetry.dependencies]
 python = "^3.8"
 celery = "*"
+limits = "*"
 redis = "*"
 click = {version = "*", optional = true}
 SQLAlchemy = {version = "*", optional = true}
