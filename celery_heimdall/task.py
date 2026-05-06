@@ -219,7 +219,13 @@ class HeimdallTask(celery.Task, ABC):
         if broker.startswith(("redis://", "rediss://")):
             return MovingWindowRateLimiter(RedisStorage(broker))
 
-        raise NotImplementedError()
+        # Fall back to deriving the URL from the Redis instance provided by
+        # setup_redis(), so subclasses only need to override setup_redis().
+        kwargs = self.heimdall_redis.connection_pool.connection_kwargs
+        host = kwargs.get("host", "localhost")
+        port = kwargs.get("port", 6379)
+        db = kwargs.get("db", 0)
+        return MovingWindowRateLimiter(RedisStorage(f"redis://{host}:{port}/{db}"))
 
     def setup_redis(self) -> redis.Redis:
         """
