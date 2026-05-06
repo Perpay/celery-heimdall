@@ -3,6 +3,8 @@ import enum
 import hashlib
 import datetime
 import inspect
+import random
+import time
 from abc import ABC
 from typing import Union, Tuple, Callable
 
@@ -11,6 +13,9 @@ import redis.lock
 import celery
 from kombu import serialization
 from kombu.utils import uuid
+from limits import RateLimitItemPerSecond
+from limits.storage import RedisStorage
+from limits.strategies import MovingWindowRateLimiter
 
 from celery_heimdall.config import Config
 from celery_heimdall.errors import AlreadyQueuedError
@@ -96,62 +101,66 @@ def rate_limited_countdown(task: "HeimdallTask", key, args, kwargs):
     # Based on improvements to Vigrond's original implementation by mlissner
     # on stack overflow.
     h = getattr(task, "heimdall", {})
-    r = task.heimdall_redis
 
     if "rate_limit" in h:
-        try:
-            times, per = h["rate_limit"].rate_limit
-        except TypeError as e:
-            f = h["rate_limit"].rate_limit
+        config = h["rate_limit"]
 
-            rate_limit_args = {}
-            signature = inspect.signature(f)
-            if "key" in signature.parameters:
-                rate_limit_args["key"] = key
-            if "task" in signature.parameters:
-                rate_limit_args["task"] = task
-            if "args" in signature.parameters:
-                rate_limit_args["args"] = args
-            if "kwargs" in signature.parameters:
-                rate_limit_args["kwargs"] = kwargs
+        # Plain callable: (args, kwargs) → None | (key, times, per).
+        # None means no rate limit for this invocation. The (key, times, per)
+        # form allows dynamic per-invocation limits with custom Redis key scoping.
+        if callable(config) and not isinstance(config, RateLimit):
+            resolved = config(args, kwargs)
+            if resolved is None:
+                return 0
+            key, times, per = resolved
+        else:
+            try:
+                times, per = config.rate_limit
+            except TypeError as e:
+                f = config.rate_limit
 
-            times, per = h["rate_limit"].rate_limit(**rate_limit_args)
+                rate_limit_args = {}
+                signature = inspect.signature(f)
+                if "key" in signature.parameters:
+                    rate_limit_args["key"] = key
+                if "task" in signature.parameters:
+                    rate_limit_args["task"] = task
+                if "args" in signature.parameters:
+                    rate_limit_args["args"] = args
+                if "kwargs" in signature.parameters:
+                    rate_limit_args["kwargs"] = kwargs
+
+                times, per = config.rate_limit(**rate_limit_args)
     else:
         times, per = h["times"], h["per"]
 
-    number_of_running_tasks = r.get(key)
-    if number_of_running_tasks is None:
-        r.set(key, 1, ex=per)
+    rate = RateLimitItemPerSecond(times, per)
+    limiter = task.heimdall_rate_limiter
+
+    # Fix Bug 1: replaces the non-atomic GET + INCR pair with limiter.hit(),
+    # which atomically checks and increments via the limits library. The
+    # original two-step approach allowed multiple workers to simultaneously
+    # read a count below the limit and all proceed, bypassing the cap entirely.
+    if limiter.hit(rate, key):
         return 0
 
-    if int(number_of_running_tasks) < times:
-        if r.incr(key, 1) == 1:
-            r.expire(key, per)
-        return 0
+    stats = limiter.get_window_stats(rate, key)
+    reset_seconds = max(0.0, stats.reset_time - time.time())
 
-    schedule_key = f"{key}.schedule"
-    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    # Fix Bug 2: float division instead of per // times. Integer division
+    # produces 0 when per < times (e.g. 10 tasks/30s => 10 // 30 = 0),
+    # collapsing all excess tasks onto the same retry moment and causing an
+    # ever-growing burst each window. Float division + jitter spreads them
+    # evenly across the window.
+    per_task_spacing = per / times
 
-    delay = r.get(schedule_key)
-    if delay is None or int(delay) < now.timestamp():
-        # Either not scheduled, or scheduled in the past.
-        ttl = r.ttl(key)
-        if ttl < 0:
-            return 0
+    # Stats sampled at the window boundary: hit() saw a full window but
+    # get_window_stats() saw it already cleared. Retry after a short jittered
+    # delay so hit() decides on the next attempt.
+    if reset_seconds <= 0:
+        return random.uniform(1e-3, per_task_spacing)
 
-        r.set(
-            schedule_key,
-            int((now + datetime.timedelta(seconds=ttl)).timestamp()),
-            ex=ttl + 20,
-        )
-        return ttl
-
-    new_time = datetime.datetime.fromtimestamp(
-        int(delay), tz=datetime.timezone.utc
-    ) + datetime.timedelta(seconds=per // times)
-    new_delay = int((new_time - now).total_seconds())
-    r.set(schedule_key, int(new_time.timestamp()), ex=new_delay + 20)
-    return new_delay
+    return reset_seconds + random.uniform(0, per_task_spacing)
 
 
 class HeimdallTask(celery.Task, ABC):
@@ -167,6 +176,7 @@ class HeimdallTask(celery.Task, ABC):
         super().__init__()
         self._heimdall_config = None
         self._heimdall_redis = None
+        self._heimdall_rate_limiter = None
 
     @property
     def heimdall_config(self) -> Config:
@@ -179,6 +189,37 @@ class HeimdallTask(celery.Task, ABC):
         if not self._heimdall_redis:
             self._heimdall_redis = self.setup_redis()
         return self._heimdall_redis
+
+    @property
+    def heimdall_rate_limiter(self) -> MovingWindowRateLimiter:
+        if not self._heimdall_rate_limiter:
+            self._heimdall_rate_limiter = self.setup_rate_limiter()
+        return self._heimdall_rate_limiter
+
+    def setup_rate_limiter(self) -> MovingWindowRateLimiter:
+        """
+        Sets up the rate limiter used for atomic check-and-increment. By
+        default uses the same Redis instance as setup_redis(). Override to
+        provide a custom limiter, e.g.:
+
+        .. code::
+
+            from limits.storage import RedisStorage
+            from limits.strategies import MovingWindowRateLimiter
+
+            class MyTask(HeimdallTask):
+                def setup_rate_limiter(self):
+                    return MovingWindowRateLimiter(RedisStorage("redis://"))
+        """
+        backend = self.app.conf.get("result_backend") or ""
+        if backend.startswith(("redis://", "rediss://")):
+            return MovingWindowRateLimiter(RedisStorage(backend))
+
+        broker = self.app.conf.get("broker_url") or ""
+        if broker.startswith(("redis://", "rediss://")):
+            return MovingWindowRateLimiter(RedisStorage(broker))
+
+        raise NotImplementedError()
 
     def setup_redis(self) -> redis.Redis:
         """
@@ -267,15 +308,38 @@ class HeimdallTask(celery.Task, ABC):
                 kwargs,
             )
             if delay > 0:
+                # Release the unique lock before retrying so the retry's
+                # apply_async can re-acquire it. Without this, apply_async sees
+                # the lock as still held and silently no-ops the dispatch — the
+                # task enters RETRY state but never actually runs again.
+                if h and "unique" in h:
+                    release_lock(
+                        self,
+                        unique_key_for_task(
+                            self,
+                            args,
+                            kwargs,
+                            prefix=self.heimdall_config.lock_prefix,
+                        ),
+                    )
                 # We don't want our rescheduling retry to count against
                 # any normal retry limits the user might have set on the
                 # task or globally.
                 self.request.retries -= 1
-                # Max retries needs to be set to None _before_ calling
-                # retry(). This value will not propagate, allowing the user's
-                # normal retry behaviour to apply on the next call.
+                # Save and restore max_retries around the retry call. Celery
+                # reuses one task instance per worker; without restoration,
+                # setting max_retries=None here permanently shadows the
+                # class-level value for all future invocations on this worker.
+                _had_instance_max_retries = "max_retries" in self.__dict__
+                _saved_max_retries = self.__dict__.get("max_retries")
                 self.max_retries = None
-                raise self.retry(countdown=delay)
+                try:
+                    raise self.retry(countdown=delay)
+                finally:
+                    if _had_instance_max_retries:
+                        self.max_retries = _saved_max_retries
+                    else:
+                        del self.max_retries
 
         # Normally, we check for uniqueness before calling the task, but if
         # celery beat is being used, it appears to bypass the apply_async
