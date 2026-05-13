@@ -1,7 +1,6 @@
 import dataclasses
 import enum
 import hashlib
-import datetime
 import inspect
 import random
 import time
@@ -13,12 +12,38 @@ import redis.lock
 import celery
 from kombu import serialization
 from kombu.utils import uuid
-from limits import RateLimitItemPerSecond
-from limits.storage import RedisStorage
-from limits.strategies import MovingWindowRateLimiter
 
 from celery_heimdall.config import Config
 from celery_heimdall.errors import AlreadyQueuedError
+
+# Sliding window rate limiter using a sorted set. Each allowed request is
+# stored as a scored entry (score = arrival timestamp in ms). On every call:
+#   1. Expired entries outside the window are pruned atomically.
+#   2. If count < limit the request is recorded and 0 is returned (allowed).
+#   3. Otherwise the expiry timestamp of the oldest entry is returned so the
+#      caller can compute an exact retry countdown without a second round-trip.
+#
+# KEYS[1]  - rate limit key
+# ARGV[1]  - current time in milliseconds
+# ARGV[2]  - window size in milliseconds
+# ARGV[3]  - max requests per window
+_MOVING_WINDOW_LUA = """
+local now    = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit  = tonumber(ARGV[3])
+
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+local count = redis.call('ZCARD', KEYS[1])
+
+if count < limit then
+    redis.call('ZADD', KEYS[1], now, tostring(now) .. '-' .. tostring(count))
+    redis.call('PEXPIRE', KEYS[1], window)
+    return 0
+end
+
+local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+return tonumber(oldest[2]) + window
+"""
 
 
 class Strategy(enum.Enum):
@@ -113,10 +138,11 @@ def rate_limited_countdown(task: "HeimdallTask", key, args, kwargs):
             if resolved is None:
                 return 0
             key, times, per = resolved
+
         else:
             try:
                 times, per = config.rate_limit
-            except TypeError as e:
+            except TypeError:
                 f = config.rate_limit
 
                 rate_limit_args = {}
@@ -134,32 +160,24 @@ def rate_limited_countdown(task: "HeimdallTask", key, args, kwargs):
     else:
         times, per = h["times"], h["per"]
 
-    rate = RateLimitItemPerSecond(times, per)
-    limiter = task.heimdall_rate_limiter
+    now_ms = int(time.time() * 1000)
+    window_ms = per * 1000
+    reset_ms = task.heimdall_redis.register_script(_MOVING_WINDOW_LUA)(
+        keys=[key],
+        args=[now_ms, window_ms, times],
+    )
 
-    # Fix Bug 1: replaces the non-atomic GET + INCR pair with limiter.hit(),
-    # which atomically checks and increments via the limits library. The
-    # original two-step approach allowed multiple workers to simultaneously
-    # read a count below the limit and all proceed, bypassing the cap entirely.
-    if limiter.hit(rate, key):
+    if reset_ms == 0:
         return 0
 
-    stats = limiter.get_window_stats(rate, key)
-    reset_seconds = max(0.0, stats.reset_time - time.time())
-
-    # Fix Bug 2: float division instead of per // times. Integer division
-    # produces 0 when per < times (e.g. 10 tasks/30s => 10 // 30 = 0),
-    # collapsing all excess tasks onto the same retry moment and causing an
-    # ever-growing burst each window. Float division + jitter spreads them
-    # evenly across the window.
+    reset_seconds = max(0.0, (reset_ms - now_ms) / 1000.0)
+    # Float division instead of per // times. Integer division produces 0 when
+    # per < times (e.g. 10 tasks/30s => 10 // 30 = 0), collapsing all excess
+    # tasks onto the same retry moment and causing an ever-growing burst each
+    # window. Float division + jitter spreads them evenly across the window.
     per_task_spacing = per / times
-
-    # Stats sampled at the window boundary: hit() saw a full window but
-    # get_window_stats() saw it already cleared. Retry after a short jittered
-    # delay so hit() decides on the next attempt.
     if reset_seconds <= 0:
         return random.uniform(1e-3, per_task_spacing)
-
     return reset_seconds + random.uniform(0, per_task_spacing)
 
 
@@ -176,7 +194,6 @@ class HeimdallTask(celery.Task, ABC):
         super().__init__()
         self._heimdall_config = None
         self._heimdall_redis = None
-        self._heimdall_rate_limiter = None
 
     @property
     def heimdall_config(self) -> Config:
@@ -189,43 +206,6 @@ class HeimdallTask(celery.Task, ABC):
         if not self._heimdall_redis:
             self._heimdall_redis = self.setup_redis()
         return self._heimdall_redis
-
-    @property
-    def heimdall_rate_limiter(self) -> MovingWindowRateLimiter:
-        if not self._heimdall_rate_limiter:
-            self._heimdall_rate_limiter = self.setup_rate_limiter()
-        return self._heimdall_rate_limiter
-
-    def setup_rate_limiter(self) -> MovingWindowRateLimiter:
-        """
-        Sets up the rate limiter used for atomic check-and-increment. By
-        default uses the same Redis instance as setup_redis(). Override to
-        provide a custom limiter, e.g.:
-
-        .. code::
-
-            from limits.storage import RedisStorage
-            from limits.strategies import MovingWindowRateLimiter
-
-            class MyTask(HeimdallTask):
-                def setup_rate_limiter(self):
-                    return MovingWindowRateLimiter(RedisStorage("redis://"))
-        """
-        backend = self.app.conf.get("result_backend") or ""
-        if backend.startswith(("redis://", "rediss://")):
-            return MovingWindowRateLimiter(RedisStorage(backend))
-
-        broker = self.app.conf.get("broker_url") or ""
-        if broker.startswith(("redis://", "rediss://")):
-            return MovingWindowRateLimiter(RedisStorage(broker))
-
-        # Fall back to deriving the URL from the Redis instance provided by
-        # setup_redis(), so subclasses only need to override setup_redis().
-        kwargs = self.heimdall_redis.connection_pool.connection_kwargs
-        host = kwargs.get("host", "localhost")
-        port = kwargs.get("port", 6379)
-        db = kwargs.get("db", 0)
-        return MovingWindowRateLimiter(RedisStorage(f"redis://{host}:{port}/{db}"))
 
     def setup_redis(self) -> redis.Redis:
         """
